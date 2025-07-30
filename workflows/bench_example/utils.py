@@ -44,13 +44,13 @@ def load_mapping(s):
     return json.loads(s)
 
 
-def process_surface_results(filenames, field_mapping):
+def process_surface_results(filenames, field_mapping, device="cpu"):
     mesh_filename, pc_filename = filenames[0], filenames[1]
     results = {}
     if pc_filename is None:
-        print(f"Processing: {mesh_filename}")
+        print(f"Processing: {mesh_filename} on {device}")
     else:
-        print(f"Processing: {mesh_filename}, {pc_filename}")
+        print(f"Processing: {mesh_filename}, {pc_filename} on {device}")
     # Fetch the run number from the filename
     run_idx = re.search(r"(\d+)(?=\D*$)", mesh_filename).group()
     results["run_idx"] = run_idx
@@ -194,9 +194,10 @@ def process_volume_results(
     rho=None,
     compute_continuity_metrics=False,
     compute_momentum_metrics=False,
+    device="cpu",
 ):
     results = {}
-    print(f"Processing: {mesh_filename}")
+    print(f"Processing: {mesh_filename} on {device}")
     run_idx = re.search(r"(\d+)(?=\D*$)", mesh_filename).group()
     results["run_idx"] = run_idx
 

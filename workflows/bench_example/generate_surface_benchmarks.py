@@ -20,12 +20,19 @@ import pyvista as pv
 import glob
 import matplotlib.pyplot as plt
 import re
-from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 import argparse
 import json
 from functools import partial
+import torch
+import torch.multiprocessing as mp
+from torch.utils.data import Dataset
+import queue
+import threading
+import time
+from typing import List, Tuple, Dict, Optional, Union
+import logging
 
 from physicsnemo.cfd.bench.visualization.utils import (
     plot_design_scatter,
@@ -43,10 +50,362 @@ from utils import (
     load_vtps,
 )
 
+from physicsnemo.cfd.bench.interpolation.interpolate_mesh_to_pc import interpolate_mesh_to_pc
+
+from physicsnemo.cfd.bench.metrics.aero_forces import compute_drag_and_lift
+from physicsnemo.cfd.bench.metrics.l2_errors import (
+    compute_l2_errors,
+    compute_area_weighted_l2_errors,
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def process_surface_results_prefetched(data_dict, device="cpu"):
+    """Process surface results using prefetched data."""
+    mesh = data_dict["mesh"]
+    pc = data_dict["pc"]
+    mesh_filename = data_dict["mesh_filename"]
+    pc_filename = data_dict["pc_filename"]
+    field_mapping = data_dict["field_mapping"]
+    
+    results = {}
+    if pc_filename is None:
+        print(f"Processing: {mesh_filename} on {device}")
+    else:
+        print(f"Processing: {mesh_filename}, {pc_filename} on {device}")
+    
+    # Fetch the run number from the filename
+    run_idx = re.search(r"(\d+)(?=\D*$)", mesh_filename).group()
+    results["run_idx"] = run_idx
+
+    # compute drag and lift coefficients
+    (
+        results["Cd_true"],
+        results["Cd_p_true"],
+        results["Cd_f_true"],
+        results["Cl_true"],
+        results["Cl_p_true"],
+        results["Cl_f_true"],
+    ) = compute_drag_and_lift(
+        mesh,
+        pressure_field=field_mapping["p"],
+        wss_field=field_mapping["wallShearStress"],
+    )
+
+    (
+        results["Cd_pred"],
+        results["Cd_p_pred"],
+        results["Cd_f_pred"],
+        results["Cl_pred"],
+        results["Cl_p_pred"],
+        results["Cl_f_pred"],
+    ) = compute_drag_and_lift(
+        mesh,
+        pressure_field=field_mapping["pPred"],
+        wss_field=field_mapping["wallShearStressPred"],
+    )
+
+    # compute L2 errors
+    results["l2_errors"] = compute_l2_errors(
+        mesh,
+        [
+            field_mapping["p"],
+            field_mapping["wallShearStress"],
+        ],
+        [
+            field_mapping["pPred"],
+            field_mapping["wallShearStressPred"],
+        ],
+        dtype="cell",
+    )
+    results["l2_errors_area_wt"] = compute_area_weighted_l2_errors(
+        mesh,
+        [
+            field_mapping["p"],
+            field_mapping["wallShearStress"],
+        ],
+        [
+            field_mapping["pPred"],
+            field_mapping["wallShearStressPred"],
+        ],
+        dtype="cell",
+    )
+
+    # compute centerlines
+    slice_y_0 = mesh.slice(normal="y", origin=(0, 0, 0))
+    results["centerline_top"] = slice_y_0.clip(
+        normal="z", origin=(0, 0, 0.4), invert=False
+    )
+    results["centerline_bottom"] = slice_y_0.clip(
+        normal="z", origin=(0, 0, 0.4), invert=True
+    )
+
+    if pc is not None:
+        # compute pc interpolations and results
+        results["l2_errors_pc"] = compute_l2_errors(
+            pc,
+            [
+                field_mapping["p"],
+                field_mapping["wallShearStress"],
+            ],
+            [
+                field_mapping["pPred"],
+                field_mapping["wallShearStressPred"],
+            ],
+            dtype="point",
+        )
+
+        # compute drag and lift coefficients
+        (
+            results["Cd_true_pc"],
+            results["Cd_p_true_pc"],
+            results["Cd_f_true_pc"],
+            results["Cl_true_pc"],
+            results["Cl_p_true_pc"],
+            results["Cl_f_true_pc"],
+        ) = compute_drag_and_lift(
+            pc,
+            pressure_field=field_mapping["p"],
+            wss_field=field_mapping["wallShearStress"],
+            dtype="point",
+        )
+
+        (
+            results["Cd_pred_pc"],
+            results["Cd_p_pred_pc"],
+            results["Cd_f_pred_pc"],
+            results["Cl_pred_pc"],
+            results["Cl_p_pred_pc"],
+            results["Cl_f_pred_pc"],
+        ) = compute_drag_and_lift(
+            pc,
+            pressure_field=field_mapping["pPred"],
+            wss_field=field_mapping["wallShearStressPred"],
+            dtype="point",
+        )
+    else:
+        results["l2_errors_pc"] = None
+        results["Cd_true_pc"] = None
+        results["Cd_p_true_pc"] = None
+        results["Cd_f_true_pc"] = None
+        results["Cl_true_pc"] = None
+        results["Cl_p_true_pc"] = None
+        results["Cl_f_true_pc"] = None
+        results["Cd_pred_pc"] = None
+        results["Cd_p_pred_pc"] = None
+        results["Cd_f_pred_pc"] = None
+        results["Cl_pred_pc"] = None
+        results["Cl_p_pred_pc"] = None
+        results["Cl_f_pred_pc"] = None
+
+    return results
+
+
+class SurfaceBenchmarkDataset(Dataset):
+    """Dataset for surface benchmark data loading with prefetching."""
+    
+    def __init__(self, filenames: List[Tuple[str, Optional[str]]], field_mapping: Dict[str, str]):
+        self.filenames = filenames
+        self.field_mapping = field_mapping
+        
+    def __len__(self):
+        return len(self.filenames)
+    
+    def __getitem__(self, idx):
+        mesh_filename, pc_filename = self.filenames[idx]
+        
+        try:
+            # Load mesh data
+            mesh = pv.read(mesh_filename)
+            mesh = mesh.point_data_to_cell_data()
+            
+            # Load point cloud data if available
+            pc = None
+            if pc_filename is not None:
+                pc = pv.read(pc_filename)
+                # Interpolate true results from mesh because PCs don't have them
+                pc = interpolate_mesh_to_pc(
+                    pc, mesh, [self.field_mapping["p"], self.field_mapping["wallShearStress"]]
+                )
+            
+            return {
+                "mesh": mesh,
+                "pc": pc,
+                "mesh_filename": mesh_filename,
+                "pc_filename": pc_filename,
+                "field_mapping": self.field_mapping
+            }
+            
+        except Exception as e:
+            logger.error(f"Error loading data for {mesh_filename}: {e}")
+            return None
+
+
+class DistributedSurfaceProcessor:
+    """Distributed processor for surface benchmark computations."""
+    
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        device: str = "cpu"
+    ):
+        self.world_size = world_size
+        self.rank = rank
+        self.device = device
+        
+        # Set device
+        if device.startswith("cuda"):
+            if not torch.cuda.is_available():
+                logger.warning("CUDA not available, falling back to CPU")
+                self.device = "cpu"
+            else:
+                torch.cuda.set_device(int(device.split(":")[1]) if ":" in device else 0)
+        
+        logger.info(f"Initialized processor: rank={rank}, device={self.device}")
+    
+
+    
+    def get_data_subset(self, dataset: SurfaceBenchmarkDataset):
+        """Get the subset of data for this rank."""
+        total_samples = len(dataset)
+        samples_per_rank = total_samples // self.world_size
+        start_idx = self.rank * samples_per_rank
+        end_idx = start_idx + samples_per_rank if self.rank < self.world_size - 1 else total_samples
+        return start_idx, end_idx
+    
+    def run_processing(self, dataset: SurfaceBenchmarkDataset):
+        """Run distributed processing."""
+        # Get the subset of data for this rank
+        total_samples = len(dataset)
+        samples_per_rank = total_samples // self.world_size
+        start_idx = self.rank * samples_per_rank
+        end_idx = start_idx + samples_per_rank if self.rank < self.world_size - 1 else total_samples
+        
+        # Process samples one by one
+        all_results = []
+        for i in range(start_idx, end_idx):
+            sample = dataset[i]
+            logger.info(f"Rank {self.rank}: Processing sample {i+1}/{total_samples}")
+            
+            # Process single sample
+            try:
+                if sample is None:
+                    logger.warning(f"Rank {self.rank}: Skipping None sample at index {i}")
+                    continue
+                    
+                result = process_surface_results_prefetched(sample, self.device)
+                all_results.append(result)
+            except Exception as e:
+                logger.error(f"Rank {self.rank}: Error processing sample {i}: {e}")
+                continue
+            
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+        
+        logger.info(f"Rank {self.rank}: Completed processing {len(all_results)} samples")
+        return all_results
+
+
+def setup_distributed_processing(
+    world_size: int,
+    device_type: str = "cpu"
+) -> List[Dict]:
+    """Setup distributed processing configuration."""
+    configs = []
+    
+    if device_type == "gpu":
+        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if available_gpus < world_size:
+            logger.warning(f"Requested {world_size} GPUs but only {available_gpus} available. Some processes will share GPUs.")
+        
+        for rank in range(world_size):
+            gpu_id = rank % max(available_gpus, 1)
+            configs.append({
+                "rank": rank,
+                "device": f"cuda:{gpu_id}"
+            })
+    else:
+        for rank in range(world_size):
+            configs.append({
+                "rank": rank,
+                "device": "cpu"
+            })
+    
+    return configs
+
+
+def worker_process(rank: int, world_size: int, config: Dict, dataset: SurfaceBenchmarkDataset, 
+                  result_queue: mp.Queue):
+    """Worker process for distributed processing."""
+    try:
+        logger.info(f"Worker {rank}: Starting with config: {config}")
+        
+        processor = DistributedSurfaceProcessor(
+            world_size=world_size,
+            rank=rank,
+            device=config["device"]
+        )
+        
+        results = processor.run_processing(dataset)
+        logger.info(f"Worker {rank}: Completed processing {len(results)} samples")
+        result_queue.put((rank, results))
+        
+    except Exception as e:
+        logger.error(f"Error in worker process {rank}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        result_queue.put((rank, []))
+
+
+def run_distributed_processing(
+    filenames: List[Tuple[str, Optional[str]]],
+    field_mapping: Dict[str, str],
+    world_size: int,
+    device_type: str = "cpu"
+) -> List[Dict]:
+    """Run distributed processing with multiple workers."""
+    
+    # Setup distributed configuration
+    configs = setup_distributed_processing(world_size, device_type)
+    
+    # Create dataset
+    dataset = SurfaceBenchmarkDataset(filenames, field_mapping)
+    
+    # Create result queue
+    result_queue = mp.Queue()
+    
+    # Start worker processes
+    processes = []
+    for rank in range(world_size):
+        config = configs[rank]
+        p = mp.Process(
+            target=worker_process,
+            args=(rank, world_size, config, dataset, result_queue)
+        )
+        p.start()
+        processes.append(p)
+    
+    # Collect results
+    all_results = []
+    for _ in range(world_size):
+        rank, results = result_queue.get()
+        all_results.extend(results)
+        logger.info(f"Received results from rank {rank}: {len(results)} samples")
+    
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+    
+    return all_results
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description="Compute the validation results for surface meshes"
+        description="Compute the validation results for surface meshes with distributed processing"
     )
     parser.add_argument(
         "sim_results_dir", type=str, help="directory with surface vtp files"
@@ -57,12 +416,19 @@ if __name__ == "__main__":
         help="directory with point cloud vtp files (optional)",
     )
     parser.add_argument(
-        "-n",
-        "--num-procs",
+        "--world-size",
         type=int,
         default=1,
         help="number of parallel processes to use",
     )
+    parser.add_argument(
+        "--device-type",
+        type=str,
+        choices=["cpu", "gpu"],
+        default="cpu",
+        help="device type for processing (cpu or gpu)",
+    )
+
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -89,6 +455,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Set multiprocessing start method
+    mp.set_start_method('spawn', force=True)
+
     sim_mesh_results_dir = args.sim_results_dir
     pc_results_dir = args.pc_results_dir
 
@@ -114,6 +483,13 @@ if __name__ == "__main__":
             pc_filenames.append(None)
 
     filenames = list(zip(mesh_filenames, pc_filenames))
+    
+    # Check if we have any files to process
+    if not filenames:
+        logger.error(f"No VTP files found in {sim_mesh_results_dir}")
+        sys.exit(1)
+    
+    logger.info(f"Found {len(filenames)} files to process")
 
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -140,12 +516,21 @@ if __name__ == "__main__":
         or not top_centerlines
         or not bottom_centerlines
     ):
-        # Process the data if any of the required files are missing
-        with Pool(processes=args.num_procs) as pool:
-            mesh_results = pool.map(
-                partial(process_surface_results, field_mapping=args.field_mapping),
-                filenames,
-            )
+        # Process the data using distributed processing
+        logger.info(f"Starting distributed processing with {args.world_size} processes")
+        logger.info(f"Device type: {args.device_type}")
+        if args.device_type == "gpu":
+            available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            logger.info(f"Available GPUs: {available_gpus}")
+            if available_gpus < args.world_size:
+                logger.warning(f"Requested {args.world_size} processes but only {available_gpus} GPUs available")
+        
+        mesh_results = run_distributed_processing(
+            filenames=filenames,
+            field_mapping=args.field_mapping,
+            world_size=args.world_size,
+            device_type=args.device_type
+        )
 
         # Prepare data for saving
         results = {
@@ -178,6 +563,11 @@ if __name__ == "__main__":
             "Cl_p_pred_pc": [],
             "Cl_f_pred_pc": [],
         }
+        # Check if we have any results
+        if not mesh_results:
+            logger.error("No results were processed. Check if input files exist and are accessible.")
+            sys.exit(1)
+            
         l2_errors = {"run_idx": []}
         for key in mesh_results[0]["l2_errors"].keys():
             l2_errors[key] = []
@@ -457,20 +847,22 @@ if __name__ == "__main__":
         for key, value in mean_l2_errors_pc.items():
             print(f"L2 Errors for PC, {key}: {value}")
 
-    plot_filenames = []
-    for filename in mesh_filenames:
-        run_idx = re.search(r"(\d+)(?=\D*$)", filename).group()
+    if args.contour_plot_ids is not None:
+        plot_filenames = []
+        for filename in mesh_filenames:
+            run_idx = re.search(r"(\d+)(?=\D*$)", filename).group()
 
-        if run_idx in args.contour_plot_ids:
-            plot_filenames.append(filename)
+            if run_idx in args.contour_plot_ids:
+                plot_filenames.append(filename)
 
-    print(f"Plotting contour plots for {args.contour_plot_ids}")
-    with Pool(processes=args.num_procs) as pool:
-        _ = pool.map(
-            partial(
-                plot_surface_results,
-                field_mapping=args.field_mapping,
-                output_dir=args.output_dir,
-            ),
-            plot_filenames,
-        )
+        print(f"Plotting contour plots for {args.contour_plot_ids}")
+        from multiprocessing import Pool
+        with Pool(processes=args.world_size) as pool:
+            _ = pool.map(
+                partial(
+                    plot_surface_results,
+                    field_mapping=args.field_mapping,
+                    output_dir=args.output_dir,
+                ),
+                plot_filenames,
+            )
