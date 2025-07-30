@@ -368,9 +368,14 @@ def compute_gradients_gpu(points, u, grad_u, offsets, indices, N, D):
 def _compute_continuity(points, u, adjacency, device="cpu"):
     if device == "cpu":
         grad_u = compute_gradients(points, u, adjacency)
-    elif device == "gpu":
+    elif device.startswith("cuda"):
         import cupy as cp
-
+        
+        # Set the specific GPU device
+        if ":" in device:
+            gpu_id = int(device.split(":")[1])
+            cp.cuda.Device(gpu_id).use()
+        
         offsets, indices = adjacency
         points = cp.asarray(points)
         u = cp.asarray(u)
@@ -383,6 +388,7 @@ def _compute_continuity(points, u, adjacency, device="cpu"):
             points, u, grad_u, offsets, indices, points.shape[0], u.shape[1]
         )
         grad_u = cp.asnumpy(grad_u)
+    
     return sum(
         [grad_u[:, i, i] for i in range(3)]
     )  # Trace of the velocity gradient tensor
@@ -395,8 +401,13 @@ def _compute_momentum(points, u, p, mu, rho, adjacency, device="cpu"):
 
     if device == "cpu":
         grad_u_p = compute_gradients(points, u_p, adjacency)
-    elif device == "gpu":
+    elif device.startswith("cuda"):
         import cupy as cp
+        
+        # Set the specific GPU device
+        if ":" in device:
+            gpu_id = int(device.split(":")[1])
+            cp.cuda.Device(gpu_id).use()
 
         offsets, indices = adjacency
         points = cp.asarray(points)
@@ -424,8 +435,13 @@ def _compute_momentum(points, u, p, mu, rho, adjacency, device="cpu"):
 
     if device == "cpu":
         tau_grad = compute_gradients(points, tau, adjacency)
-    elif device == "gpu":
+    elif device.startswith("cuda"):
         import cupy as cp
+        
+        # Set the specific GPU device
+        if ":" in device:
+            gpu_id = int(device.split(":")[1])
+            cp.cuda.Device(gpu_id).use()
 
         offsets, indices = adjacency
         points = cp.asarray(points)

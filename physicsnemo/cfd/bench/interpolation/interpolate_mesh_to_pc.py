@@ -26,9 +26,14 @@ def _create_nbrs_surface(
         nbrs_surface = NearestNeighbors(
             n_neighbors=n_neighbors, algorithm=algorithm
         ).fit(coords_source)
-    elif device == "gpu":
+    elif device.startswith("cuda"):
         import cupy as cp
         from cuml.neighbors import NearestNeighbors as NearestNeighborsGPU
+        
+        # Set the specific GPU device
+        if ":" in device:
+            gpu_id = int(device.split(":")[1])
+            cp.cuda.Device(gpu_id).use()
 
         if not isinstance(coords_source, cp.ndarray):
             coords_source = cp.asarray(coords_source)
@@ -58,8 +63,13 @@ def _interpolate(
             field_interp = np.sum(
                 normalized_weights[:, :, np.newaxis] * field_neighbors, axis=1
             )
-    elif device == "gpu":
+    elif device.startswith("cuda"):
         import cupy as cp
+        
+        # Set the specific GPU device
+        if ":" in device:
+            gpu_id = int(device.split(":")[1])
+            cp.cuda.Device(gpu_id).use()
 
         if not isinstance(field, cp.ndarray):
             field = cp.asarray(field)
@@ -92,7 +102,7 @@ def _interpolate(
     return field_interp
 
 
-def interpolate_mesh_to_pc(pc, mesh, fields_to_interpolate):
+def interpolate_mesh_to_pc(pc, mesh, fields_to_interpolate, device="cpu"):
     """Interpolate mesh results on a point cloud using inverse weighted kNN
 
     Parameters
@@ -103,6 +113,8 @@ def interpolate_mesh_to_pc(pc, mesh, fields_to_interpolate):
         Mesh for the source values (PyVista Dataset)
     fields_to_interpolate :
         List of fields (str) to interpolate (must be present in the mesh dataset)
+    device : str, optional
+        Device to use for computation ("cpu" or "cuda:X"), by default "cpu"
 
     Returns
     -------
@@ -117,12 +129,12 @@ def interpolate_mesh_to_pc(pc, mesh, fields_to_interpolate):
 
     # Fit the kNN model
     nbrs_surface = _create_nbrs_surface(
-        surface_cell_centers, n_neighbors=k, algorithm="ball_tree"
+        surface_cell_centers, n_neighbors=k, algorithm="ball_tree", device=device
     )
 
     for field in fields_to_interpolate:
         pc.point_data[field] = _interpolate(
-            nbrs_surface, pc.points, mesh.cell_data[field]
+            nbrs_surface, pc.points, mesh.cell_data[field], device=device
         )
 
     return pc
