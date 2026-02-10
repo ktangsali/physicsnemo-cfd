@@ -33,8 +33,8 @@ dynamic = ["version"]
 [project.optional-dependencies]
 # dependencies for GPU-accelerated functionality
 gpu = [
-    "cupy-cuda12x>=13.3.0",
-    "cuml-cu12>=25.2.0",
+    "cupy-cuda13x>=13.6.0",
+    "cuml-cu13>=25.10.0",
     "warp-lang>=1.7.1",
 ]
 all = [

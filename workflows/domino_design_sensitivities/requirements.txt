@@ -1,6 +1,6 @@
 git+https://github.com/NVIDIA/apex.git
 hydra-core
-cupy-cuda12x
+cupy-cuda13x
 numba
 requests
-"cuml-cu12>=25.2.0"
+"cuml-cu13>=25.10.0"
