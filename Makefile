@@ -27,9 +27,14 @@ doctest:
 	echo "Not implemented"
 
 pytest: 
-	echo "Not implemented"
+	python -m pytest test/ci_tests/ -v --tb=short
 
 coverage:
 	echo "Not implemented"
+
+docs:
+	uv pip install -e ".[docs]"
+	$(MAKE) -C docs clean
+	$(MAKE) -C docs html
 
 all-ci: setup-ci black interrogate lint license install pytest doctest coverage

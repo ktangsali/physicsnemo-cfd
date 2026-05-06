@@ -8,3 +8,17 @@ __pycache__/
 .ipynb_checkpoints
 *.egg-info
 build/
+_build/
+
+# Python virtualenvs and tool caches
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+
+# Editor / IDE
+.cursor/
+.vscode/
+.idea/

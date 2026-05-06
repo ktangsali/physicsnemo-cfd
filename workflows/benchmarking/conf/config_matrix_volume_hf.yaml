@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Matrix volume benchmark using HF-hosted checkpoints (GeoTransolver, Transolver, DoMINO).
+# Same structure as ``config_matrix_volume_custom.yaml`` but checkpoints resolve from Hub via
+# ``builtin_packages`` — omit ``checkpoint`` / ``stats_path`` / ``domino_config`` kwargs when using defaults.
+#
+# Reports/visuals: ``reports.enabled: false`` by default (metrics still run). Set to ``true`` to
+# generate PNGs from the ``reports.visuals`` block below.
+#
+# XMGN / FIGConvNet have no volume checkpoints on Hub — omit them here.
+#
+# Run:
+#   python main.py --config-name=config_matrix_volume_hf
+#
+# Requires: huggingface-cli login (or HF_TOKEN) when pulling private artifacts.
+
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: ${run.output_dir}
+  output_subdir: hydra
+  job:
+    chdir: false
+
+case_id: null
+
+run:
+  device: "cuda:0"
+  output_dir: "benchmark_results_matrix_volume_hf"
+  seed: 42
+  batch_size: 1
+  save_inference_mesh: false
+  metrics_cache:
+    enabled: true
+    path: ${run.output_dir}/metrics_cache
+
+benchmark:
+  mode: matrix
+  models:
+    - name: geotransolver_volume
+      inference_domain: volume
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: transolver_volume
+      inference_domain: volume
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: domino_volume
+      inference_domain: volume
+      kwargs: {}
+  datasets:
+    - name: drivaerml
+      root: "/code/drivaerml"
+      # Volume wrappers always evaluate at mesh points; pin GT extraction to point_data so
+      # GT and predictions live on the same dofs (``compute_l2_errors`` runs with dtype="point").
+      kwargs: { gt_data_type: point, inference_domain: volume }
+  reproducibility:
+    log_env: false
+    save_artifacts: true
+
+output:
+  # volume_mesh_field_names / ground_truth_volume_mesh_field_names: VTK array names used when writing optional .vtu outputs
+  # (e.g. inference or comparison meshes); align with model outputs and GT field names from the dataset adapter.
+  volume_mesh_field_names:
+    pressure: "pressure_pred"
+    turbulent_viscosity: "turbulent_viscosity_pred"
+    velocity: "velocity_pred"
+  ground_truth_volume_mesh_field_names:
+    pressure: "pressure_true"
+    turbulent_viscosity: "turbulent_viscosity_true"
+    velocity: "velocity_true"
+  streamlines_vector_canonical: velocity
+
+# Subset of ``config_matrix_volume_custom.yaml`` field metrics (L2 trio only). Residual metrics
+# ``continuity_residual_l2`` / ``momentum_residual_l2`` are omitted here; add them if your config supports them.
+# Omit ``drag`` / ``lift`` (surface-domain metrics).
+metrics:
+  - l2_pressure
+  - l2_turbulent_viscosity
+  - l2_velocity
+
+
+# Reports/visuals aligned with volume custom matrix; ``reports.enabled: false`` here (enable to run visuals).
+reports:
+  enabled: false
+  save_comparison_meshes: false
+  comparison_mesh_subdir: comparison_meshes
+  visual_case_ids: [run_1, run_11]
+  visuals:
+    - name: plot_fields_volume
+      view: xy
+    - name: line_plot
+      canonical_key: pressure
+      plot_coord: x
+      normalize_factor: 1.0
+      true_line_kwargs: { label: Ground truth }
+      pred_line_kwargs: { label: Prediction }
+    - name: streamlines_comparison
+      view: xy
+    - name: aggregate_volume_errors
+      bounds: [-3.5, 8.5, -2.25, 2.25, -0.32, 3.00]
+      voxel_size: 0.03
+      canonical_keys: ["pressure", "velocity", "turbulent_viscosity"]

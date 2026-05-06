@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Matrix surface benchmark using HF-hosted checkpoints (same layout as ``config_matrix_surface_custom.yaml``,
+# but checkpoints resolve from Hub via ``builtin_packages`` — omit ``checkpoint`` / ``stats_path``).
+#
+# Reports/visuals: ``reports.enabled: false`` by default (metrics still run). Set to ``true`` to
+# generate PNGs from the ``reports.visuals`` block below (same structure as the custom matrix configs).
+#
+# Run:
+#   python main.py --config-name=config_matrix_surface_hf
+#
+# Requires: huggingface-cli login (or HF_TOKEN env var) for private repos.
+
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: ${run.output_dir}
+  output_subdir: hydra
+  job:
+    chdir: false
+
+case_id: null
+
+run:
+  device: "cuda:0"
+  output_dir: "benchmark_results_matrix_surface_hf"
+  seed: 42
+  batch_size: 1
+  save_inference_mesh: false
+  metrics_cache:
+    enabled: true
+    path: ${run.output_dir}/metrics_cache
+
+benchmark:
+  mode: matrix
+  models:
+    - name: domino_surface
+      inference_domain: surface
+      kwargs: {}
+    - name: geotransolver_surface
+      inference_domain: surface
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: transolver_surface
+      inference_domain: surface
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: xmgn_surface
+      inference_domain: surface
+      # If boundary VTP omits Normals, see xmgn wrapper doc: surface_auto_orient_normals / surface_flip_normals
+      kwargs: { "max_points": 250000, "interpolation_k": 4 }
+    - name: fignet_surface
+      inference_domain: surface
+      kwargs: { "max_points": 250000, "interpolation_k": 4 }
+  datasets:
+    - name: drivaerml
+      root: "/code/drivaerml"
+      kwargs: { align_ground_truth_to_model: true, inference_domain: surface }
+  # When true: writes full os.environ → env.json (may leak HF/AWS tokens). Prefer false for shared runs.
+  reproducibility:
+    log_env: false
+    save_artifacts: false
+
+output:
+  # mesh_field_names / ground_truth_mesh_field_names: VTK array names used when writing optional .vtp outputs
+  # (e.g. inference or comparison meshes); align with model outputs and GT field names from the dataset adapter.
+  surface_interpolate_point_to_cell_for_metrics: true
+  surface_metrics_idw_k: 5
+  mesh_field_names:
+    pressure: "pressure_pred"
+    shear_stress: "wall_shear_stress_pred"
+  ground_truth_mesh_field_names:
+    pressure: "pressure_true"
+    shear_stress: "wall_shear_stress_true"
+
+metrics:
+  - l2_pressure
+  - l2_shear_stress
+  - l2_pressure_area_weighted
+  - drag
+  - lift
+
+reports:
+  enabled: false
+  save_comparison_meshes: false
+  comparison_mesh_subdir: comparison_meshes
+  visual_case_ids: [run_1, run_11]
+  visuals:
+    - name: field_comparison_surface
+      canonical_keys: [pressure, shear_stress]
+      view: xy
+    - name: line_plot
+      canonical_key: pressure
+      plot_coord: x
+      normalize_factor: 1.0
+      true_line_kwargs: { label: Ground truth }
+      pred_line_kwargs: { label: Prediction }
+    - name: line_plot
+      canonical_key: shear_stress
+      plot_coord: x
+      normalize_factor: 1.0
+      true_line_kwargs: { label: Ground truth }
+      pred_line_kwargs: { label: Prediction }
+    - name: line_plot_centerlines
+      canonical_key: pressure
+      plot_coord: x
+      normalize_factor: 1.0
+      z_clip: 0.4
+      y_slice_origin: [0, 0, 0]
+      xlabel: "X Coordinate"
+      ylabel: "Pressure"
+      true_line_kwargs: { label: Ground truth }
+      pred_line_kwargs: { label: Prediction }
+    - name: streamlines_comparison
+      canonical_key: shear_stress
+      view: xy
+    - name: design_scatter
+      pairs:
+        - { name: Cd, true_key: drag_true, pred_key: drag_pred }
+        - { name: Cl, true_key: lift_true, pred_key: lift_pred }
+    - name: design_trend
+      pairs:
+        - { name: Cd, true_key: drag_true, pred_key: drag_pred }
+        - { name: Cl, true_key: lift_true, pred_key: lift_pred }

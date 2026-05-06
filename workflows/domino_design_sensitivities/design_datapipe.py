@@ -30,12 +30,12 @@ from numpy.typing import NDArray
 from cuml.neighbors import NearestNeighbors
 from torch.utils.data import Dataset
 
-from physicsnemo.models.domino.utils import (
+from physicsnemo.utils.domino.utils import (
     calculate_center_of_mass,
     create_grid,
     normalize,
 )
-from physicsnemo.nn.functional import signed_distance_field
+from physicsnemo.utils.sdf import signed_distance_field
 import torch
 
 

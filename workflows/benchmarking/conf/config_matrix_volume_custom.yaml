@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Matrix volume benchmark: every ``benchmark.models`` entry × every ``benchmark.datasets`` entry.
+#
+# Run:
+#   python main.py --config-name=config_matrix_volume_custom
+
+# When ``checkpoint`` and ``stats_path`` are both set, they override built-in ``hf://`` defaults
+# (per-model roots in ``builtin_packages``: ``GEOTRANSOLVER_PACKAGE_ROOT``, etc.). Omit those keys to download from Hub instead.
+# DoMINO: omit ``checkpoint`` / ``stats_path`` / ``domino_config`` to pull weights + ``config.yaml`` from Hub
+# (see ``builtin_packages``); set any of them to override.
+# Uncomment or add more models (registered names: ``*_surface`` / ``*_volume`` for GeoTransolver /
+# Transolver / DoMINO; ``xmgn``, ``fignet``, …).
+
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: ${run.output_dir}
+  output_subdir: hydra
+  job:
+    chdir: false
+
+case_id: null
+
+run:
+  device: "cuda:0"
+  output_dir: "benchmark_results_matrix_volume"
+  seed: 42
+  batch_size: 1
+  save_inference_mesh: false
+  metrics_cache:
+    enabled: true
+    path: ${run.output_dir}/metrics_cache
+
+benchmark:
+  mode: matrix
+  models:
+    - name: geotransolver_volume
+      inference_domain: volume
+      checkpoint: "/path/to/geotransolver_drivaerml_volume_checkpoint/checkpoint.0.501.pt"
+      stats_path: "/path/to/geotransolver_drivaerml_volume_checkpoint/global_stats.json"
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: transolver_volume
+      inference_domain: volume
+      checkpoint: "/path/to/transolver_drivaerml_volume_checkpoint/checkpoint.0.501.pt"
+      stats_path: "/path/to/transolver_drivaerml_volume_checkpoint/global_stats.json"
+      kwargs: { batch_resolution: 60000, geometry_sampling: 300000 }
+    - name: domino_volume
+      inference_domain: volume
+      checkpoint: "/path/to/domino_drivaerml_volume_checkpoint/checkpoint.0.501.pt"
+      stats_path: "/path/to/domino_drivaerml_volume_checkpoint/scaling_factors.pkl"
+      kwargs: { "domino_config": "/path/to/domino_drivaerml_volume_checkpoint/config.yaml" }
+    # Uncomment when you have your custom model volume checkpoint + stats next to it (same layout as training).
+    # - name: volume_baseline_model
+    #   inference_domain: volume
+    #   checkpoint: "/path/to/volume_baseline_model/checkpoint.0.501.pt"
+    #   stats_path: "/path/to/volume_baseline_model/global_stats.json"
+    #   kwargs: { }
+  datasets:
+    - name: drivaerml
+      root: "/data/drivaerml"
+      # Volume wrappers always evaluate at mesh points (use ``gt_data_type: point`` for volume).
+      kwargs: { gt_data_type: point, inference_domain: volume }
+  # When true: writes full os.environ → env.json (may leak HF/AWS tokens). Prefer false for shared runs.
+  reproducibility:
+    log_env: false
+    save_artifacts: false
+
+output:
+  # volume_mesh_field_names / ground_truth_volume_mesh_field_names: VTK array names used when writing optional .vtu outputs
+  # (e.g. inference or comparison meshes); align with model outputs and GT field names from the dataset adapter.
+  volume_mesh_field_names:
+    pressure: "pressure_pred"
+    turbulent_viscosity: "turbulent_viscosity_pred"
+    velocity: "velocity_pred"
+  ground_truth_volume_mesh_field_names:
+    pressure: "pressure_true"
+    turbulent_viscosity: "turbulent_viscosity_true"
+    velocity: "velocity_true"
+  streamlines_vector_canonical: velocity
+
+metrics:
+  # drag / lift omitted: registered only for domain=surface (forces.py). Listing them with
+  # inference_domain: volume causes KeyError in get_metric(...) → swallowed as NaNs.
+  - l2_pressure
+  - l2_turbulent_viscosity
+  - l2_velocity
+  - continuity_residual_l2
+  - momentum_residual_l2
+
+reports:
+  enabled: false
+  save_comparison_meshes: false
+  comparison_mesh_subdir: comparison_meshes
+  visual_case_ids: [run_1, run_11]
+  visuals: []
