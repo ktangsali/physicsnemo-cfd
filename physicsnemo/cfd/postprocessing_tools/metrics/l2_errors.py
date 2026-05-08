@@ -14,13 +14,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any, Literal, Optional, Sequence
+
 import numpy as np
 import pyvista as pv
 import torch
+
 from physicsnemo.nn.functional import signed_distance_field
 
 # Match evaluation ``*_l2_numpy`` helpers: relative L2 ||t-p||/||t|| with absolute ||t-p|| when ||t|| ~ 0.
 _REL_L2_TRUTH_RTOL = 1e-14
+
+# DOF *location* (``"point"`` vs ``"cell"``), not a numpy ``dtype``.
+DOFType = Literal["point", "cell"]
+
+
+def _dof_coordinates(data: pv.DataSet, dtype: DOFType) -> np.ndarray:
+    """Coordinates aligned with field DOFs fetched via ``preference=dtype``.
+
+    Spatial filters (bounds masks, SDF queries) must be evaluated at the same
+    locations as the field arrays they index into. ``data.get_array(name,
+    preference="cell")`` returns length ``n_cells``, so masks built against
+    ``data.points`` (length ``n_points``) silently misalign or raise.
+    Use cell centers for ``dtype="cell"`` and node coordinates for
+    ``dtype="point"``.
+    """
+    if dtype == "cell":
+        return np.asarray(data.cell_centers().points)
+    return np.asarray(data.points)
+
+
+def _bounds_mask(
+    coords: np.ndarray, bounds: Optional[Sequence[float]]
+) -> Optional[np.ndarray]:
+    """Boolean mask selecting rows of ``coords`` inside the AABB ``bounds``.
+
+    ``bounds`` follows the ``[xmin, xmax, ymin, ymax, zmin, zmax]`` layout used
+    throughout the metrics module; returns ``None`` when ``bounds is None`` so
+    callers can short-circuit the masking step.
+    """
+    if bounds is None:
+        return None
+    return (
+        (coords[:, 0] >= bounds[0])
+        & (coords[:, 0] <= bounds[1])
+        & (coords[:, 1] >= bounds[2])
+        & (coords[:, 1] <= bounds[3])
+        & (coords[:, 2] >= bounds[4])
+        & (coords[:, 2] <= bounds[5])
+    )
+
+
+def _classify_fields(
+    data: pv.DataSet, fields: Sequence[str], dtype: DOFType
+) -> dict[str, str]:
+    """Map each field name to ``"scalar"`` (1-D) or ``"vector"`` (2-D) by array shape."""
+    out: dict[str, str] = {}
+    for f in fields:
+        arr = data.get_array(f, preference=dtype)
+        out[f] = "scalar" if arr.ndim == 1 else "vector"
+    return out
 
 
 def _relative_l2_normalized(true_field: np.ndarray, pred_field: np.ndarray) -> float:
@@ -61,7 +114,13 @@ def triangulate_surface_mesh(surface: pv.DataSet) -> pv.PolyData:
     return surface.triangulate()
 
 
-def compute_l2_errors(data, true_fields, pred_fields, bounds=None, dtype="point"):
+def compute_l2_errors(
+    data: pv.DataSet,
+    true_fields: Sequence[str],
+    pred_fields: Sequence[str],
+    bounds: Optional[Sequence[float]] = None,
+    dtype: DOFType = "point",
+) -> dict[str, float]:
     """Compute L2 error for a given mesh with true and pred fields
 
     Parameters
@@ -75,12 +134,12 @@ def compute_l2_errors(data, true_fields, pred_fields, bounds=None, dtype="point"
     bounds :
         Bounds if clipping of the data is required. Bounds must be in following format
         [xmin, xmax, ymin, ymax, zmin, zmax], by default None, which uses entire data
-    dtype : str, optional
-        Wether to compute drag from cell data or point data, by default "point"
+    dtype :
+        Whether to compute errors from cell data or point data, by default "point".
 
     Returns
     -------
-    _type_
+    dict[str, float]
         Output dictionary containing L2 errors
     """
 
@@ -91,31 +150,18 @@ def compute_l2_errors(data, true_fields, pred_fields, bounds=None, dtype="point"
         pred_fields_list
     ), "True and Pred fields not same"
 
-    # identify vector and scalar quantities
-    field_type = {}
-    for field in true_fields_list:
-        arr = data.get_array(field, preference=dtype)
-        if len(arr.shape) == 1:
-            field_type[field] = "scalar"
-        else:
-            field_type[field] = "vector"
+    field_type = _classify_fields(data, true_fields_list, dtype)
+    # Mask is built against the DOF coordinates (cell centers for ``dtype="cell"``)
+    # so it lines up with the per-DOF field arrays — see ``_dof_coordinates``.
+    spatial_mask = _bounds_mask(_dof_coordinates(data, dtype), bounds)
 
     output_dict = {}
     for true, pred in zip(true_fields_list, pred_fields_list):
         true_field = data.get_array(true, preference=dtype)
         pred_field = data.get_array(pred, preference=dtype)
-        if bounds is not None:
-            points = data.points
-            mask = (
-                (points[:, 0] >= bounds[0])
-                & (points[:, 0] <= bounds[1])
-                & (points[:, 1] >= bounds[2])
-                & (points[:, 1] <= bounds[3])
-                & (points[:, 2] >= bounds[4])
-                & (points[:, 2] <= bounds[5])
-            )
-            true_field = true_field[mask]
-            pred_field = pred_field[mask]
+        if spatial_mask is not None:
+            true_field = true_field[spatial_mask]
+            pred_field = pred_field[spatial_mask]
 
         if field_type[true] == "vector":
             # vector quantity
@@ -135,7 +181,12 @@ def compute_l2_errors(data, true_fields, pred_fields, bounds=None, dtype="point"
     return output_dict
 
 
-def compute_area_weighted_l2_errors(data, true_fields, pred_fields, dtype="point"):
+def compute_area_weighted_l2_errors(
+    data: pv.DataSet,
+    true_fields: Sequence[str],
+    pred_fields: Sequence[str],
+    dtype: DOFType = "point",
+) -> dict[str, float]:
     """Compute L2 error for a given mesh with true and pred fields
 
     Parameters
@@ -146,12 +197,12 @@ def compute_area_weighted_l2_errors(data, true_fields, pred_fields, dtype="point
         List of fields to compute L2 errors for. Should contain the names of true fields.
     pred_fields :
         List of fields to compute L2 errors for. Should contain the names of predicted fields.
-    dtype : str, optional
-        Wether to compute drag from cell data or point data, by default "point"
+    dtype :
+        Whether to compute errors from cell data or point data, by default "point".
 
     Returns
     -------
-    _type_
+    dict[str, float]
         Output dictionary containing L2 errors
     """
 
@@ -203,8 +254,15 @@ def compute_area_weighted_l2_errors(data, true_fields, pred_fields, dtype="point
 
 
 def compute_error_vs_sdf(
-    data, true_fields, pred_fields, stl_mesh, bin_edges, bounds=None, dtype="point"
-):
+    data: pv.DataSet,
+    true_fields: Sequence[str],
+    pred_fields: Sequence[str],
+    stl_mesh: pv.DataSet,
+    bin_edges: np.ndarray,
+    bounds: Optional[Sequence[float]] = None,
+    dtype: DOFType = "point",
+    device: str = "cpu",
+) -> dict[str, dict[str, Any]]:
     """Compute L2 error vs signed distance field (SDF) for a given mesh with true and pred fields
 
     This function computes error metrics as a function of distance from a surface defined by an STL mesh.
@@ -226,29 +284,24 @@ def compute_error_vs_sdf(
     bounds :
         Bounds if clipping of the data is required. Bounds must be in following format
         [xmin, xmax, ymin, ymax, zmin, zmax], by default None, which uses entire data
-    dtype : str, optional
-        Whether to compute errors from cell data or point data, by default "point"
+    dtype :
+        Whether to compute errors from cell data or point data, by default "point".
+    device :
+        ``"cpu"``, ``"gpu"``, or a torch device string (e.g. ``"cuda:0"``).
+        ``"gpu"`` is mapped to ``"cuda"`` for backward compatibility. Default
+        ``"cpu"`` matches the rest of ``postprocessing_tools`` and keeps the
+        function pure for users without CUDA; pass ``"cuda"`` (or a specific
+        ordinal) on multi-GPU hosts to keep the SDF on the GPU.
 
     Returns
     -------
-    dict
+    dict[str, dict[str, Any]]
         Output dictionary containing L2 error histograms with bin edges and mean errors for each field.
         For vector fields, returns magnitude of error. For scalar fields, returns absolute error.
         Each field entry contains:
         - "bin_edges": List of SDF bin edges
         - "mean_errors": List of mean errors for each SDF bin
     """
-    tri = triangulate_surface_mesh(stl_mesh)
-    stl_vertices = torch.tensor(np.asarray(tri.points), dtype=torch.float32)
-    stl_faces = np.asarray(tri.regular_faces, dtype=np.int64)
-    stl_indices = torch.tensor(stl_faces.flatten(), dtype=torch.int32)
-    query_points = torch.tensor(np.asarray(data.points), dtype=torch.float32)
-
-    sdf_field, _ = signed_distance_field(
-        stl_vertices, stl_indices, query_points, use_sign_winding_number=True
-    )
-    sdf_field = sdf_field.numpy()
-
     true_fields_list = true_fields
     pred_fields_list = pred_fields
 
@@ -256,34 +309,46 @@ def compute_error_vs_sdf(
         pred_fields_list
     ), "True and Pred fields not same"
 
-    # identify vector and scalar quantities
-    field_type = {}
-    for field in true_fields_list:
-        arr = data.get_array(field, preference=dtype)
-        if len(arr.shape) == 1:
-            field_type[field] = "scalar"
-        else:
-            field_type[field] = "vector"
+    # SDF query coordinates and the bounds mask must align with the per-DOF
+    # error arrays computed below (cell centers for ``dtype="cell"``); using
+    # ``data.points`` for cell data silently misaligned histograms before.
+    coords = _dof_coordinates(data, dtype)
+    spatial_mask = _bounds_mask(coords, bounds)
+    # Apply bounds *before* SDF: evaluating winding-number SDF on full-volume
+    # meshes (10^8+ DOFs) is prohibitively slow; bounds were previously only
+    # used after SDF.
+    query_points_np = coords if spatial_mask is None else coords[spatial_mask]
+
+    field_type = _classify_fields(data, true_fields_list, dtype)
+
+    torch_device = torch.device("cuda" if device == "gpu" else device)
+    # Warp launch device follows the torch tensor device (see FunctionSpec.warp_launch_context),
+    # so build all SDF inputs directly on the target device to avoid a slow CPU fallback.
+    tri = triangulate_surface_mesh(stl_mesh)
+    stl_vertices = torch.tensor(
+        np.asarray(tri.points), dtype=torch.float32, device=torch_device
+    )
+    stl_indices = torch.tensor(
+        np.asarray(tri.regular_faces, dtype=np.int64).flatten(),
+        dtype=torch.int32,
+        device=torch_device,
+    )
+    query_points = torch.tensor(
+        query_points_np, dtype=torch.float32, device=torch_device
+    )
+
+    sdf_field, _ = signed_distance_field(
+        stl_vertices, stl_indices, query_points, use_sign_winding_number=True
+    )
+    sdf_field = sdf_field.detach().cpu().numpy()
 
     output_dict = {}
     for true, pred in zip(true_fields_list, pred_fields_list):
         true_field = data.get_array(true, preference=dtype)
         pred_field = data.get_array(pred, preference=dtype)
-        if bounds is not None:
-            points = data.points
-            mask = (
-                (points[:, 0] >= bounds[0])
-                & (points[:, 0] <= bounds[1])
-                & (points[:, 1] >= bounds[2])
-                & (points[:, 1] <= bounds[3])
-                & (points[:, 2] >= bounds[4])
-                & (points[:, 2] <= bounds[5])
-            )
-            true_field = true_field[mask]
-            pred_field = pred_field[mask]
-            sdf_sub = sdf_field[mask]
-        else:
-            sdf_sub = sdf_field
+        if spatial_mask is not None:
+            true_field = true_field[spatial_mask]
+            pred_field = pred_field[spatial_mask]
 
         if field_type[true] == "vector":
             # Compute per-point error magnitude for histogram
@@ -295,7 +360,7 @@ def compute_error_vs_sdf(
 
         # For each bin, compute the mean error of points in that bin
         num_bins = bin_edges.shape[0] - 1
-        bin_indices = np.digitize(sdf_sub, bin_edges) - 1  # -1 to convert to 0-based
+        bin_indices = np.digitize(sdf_field, bin_edges) - 1  # -1 to convert to 0-based
         bin_mean_errors = []
         for i in range(num_bins):
             mask = bin_indices == i
